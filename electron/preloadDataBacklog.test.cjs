@@ -8,6 +8,13 @@ const {
   createTerminalDataBacklog,
   createTerminalDataDispatcher,
 } = require("./preload/terminalDataBacklog.cjs");
+const {
+  FLOW_LOW_WATER_MARK,
+  setRendererFlowPaused,
+  trackAck,
+  trackEmitted,
+} = require("./bridges/terminalFlowAck.cjs");
+const { createTerminalFlowPauseArbiter } = require("./bridges/terminalFlowPauseArbiter.cjs");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -583,6 +590,128 @@ test("legacy MCP-filtered plugin output returns ingress credit immediately", () 
   }
 });
 
+for (const transport of ["legacy", "port"]) {
+  test(`${transport} hidden AI command output does not strand a resize pause`, () => {
+    const preload = loadPreloadWithFakeElectron();
+    try {
+      const sessionId = "ai-resize";
+      const calls = [];
+      const session = {
+        proc: {
+          pause() { calls.push("pause"); },
+          resume() { calls.push("resume"); },
+        },
+      };
+      const visible = [];
+      let acknowledged = 0;
+      preload.api.onSessionData(sessionId, (data, meta) => {
+        visible.push(data);
+        const bytes = meta?.pluginPipelineIngressBytes ?? data.length;
+        acknowledged += bytes;
+        trackAck(session, bytes, sessionId);
+      });
+      const port = createFakePort();
+      if (transport === "port") {
+        preload.handlers.get("netcatty:terminal-output-port")?.(
+          { ports: [port] }, { sessionId },
+        );
+      }
+      let emitted = 0;
+      const deliver = (data) => {
+        emitted += data.length;
+        trackEmitted(session, data.length, sessionId);
+        if (transport === "port") port.emit({ sessionId, data });
+        else preload.handlers.get("netcatty:data")?.({}, { sessionId, data });
+      };
+
+      // Echoed wrappers and probes are hidden, but the backend charges their
+      // original length. Several short AI commands can exceed the low mark
+      // without ever reaching the high mark that normally pauses a flood.
+      for (let index = 0; index < 4; index += 1) {
+        deliver(`__NCMCP_command_${index}___S${"x".repeat(3000)}\r\n`);
+        deliver(`result-${index}\r\n`);
+      }
+      assert.ok(emitted > FLOW_LOW_WATER_MARK);
+      assert.equal(visible.join(""), "result-0\r\nresult-1\r\nresult-2\r\nresult-3\r\n");
+
+      const arbiter = createTerminalFlowPauseArbiter();
+      const lease = arbiter.acquire(sessionId, "renderer-1");
+      setRendererFlowPaused(session, lease.paused);
+      const released = arbiter.release(sessionId, "renderer-1", lease.leaseId);
+      setRendererFlowPaused(session, released.paused);
+
+      assert.deepEqual(calls, ["pause", "resume"], "settled output must resume after resize");
+      assert.equal(acknowledged, emitted, "hidden marker bytes must be acknowledged exactly once");
+      assert.equal(session.flowState.unackedBytes, 0);
+    } finally {
+      preload.cleanup();
+    }
+  });
+
+  test(`${transport} split AI markers return each original flow unit once`, () => {
+    const preload = loadPreloadWithFakeElectron();
+    try {
+      const raw = "before\r\n__NCMCP_test___S\r\nvisible-\u4f60\u597d\r\n__NCMCP_test___E0\r\nafter\r\n";
+      for (let split = 1; split < raw.length; split += 1) {
+        const sessionId = `split-${split}`;
+        const visible = [];
+        let acknowledged = 0;
+        preload.api.onSessionData(sessionId, (data, meta) => {
+          visible.push(data);
+          acknowledged += meta?.pluginPipelineIngressBytes ?? data.length;
+        });
+        const port = createFakePort();
+        if (transport === "port") {
+          preload.handlers.get("netcatty:terminal-output-port")?.(
+            { ports: [port] }, { sessionId },
+          );
+        }
+        for (const data of [raw.slice(0, split), raw.slice(split)]) {
+          if (transport === "port") port.emit({ sessionId, data });
+          else preload.handlers.get("netcatty:data")?.({}, { sessionId, data });
+        }
+
+        assert.equal(visible.join(""), "before\r\nvisible-\u4f60\u597d\r\nafter\r\n", `split ${split}`);
+        assert.equal(acknowledged, raw.length, `flow units at split ${split}`);
+      }
+    } finally {
+      preload.cleanup();
+    }
+  });
+
+  test(`${transport} marker filtering preserves explicit plugin ingress counts`, () => {
+    const preload = loadPreloadWithFakeElectron();
+    try {
+      const sessionId = "plugin-markers";
+      const visible = [];
+      let acknowledged = 0;
+      preload.api.onSessionData(sessionId, (data, meta) => {
+        visible.push(data);
+        acknowledged += meta?.pluginPipelineIngressBytes ?? data.length;
+      });
+      const port = createFakePort();
+      if (transport === "port") {
+        preload.handlers.get("netcatty:terminal-output-port")?.(
+          { ports: [port] }, { sessionId },
+        );
+      }
+      for (const [data, credit] of [
+        ["__NCMCP_TEST", 37],
+        ["\nVALUE\n", 5],
+        ["__NCMCP_OTHER\n", 0],
+      ]) {
+        const message = { sessionId, data, meta: { pluginPipelineIngressBytes: credit } };
+        if (transport === "port") port.emit(message);
+        else preload.handlers.get("netcatty:data")?.({}, message);
+      }
+      assert.equal(visible.join(""), "VALUE\n");
+      assert.equal(acknowledged, 42);
+    } finally {
+      preload.cleanup();
+    }
+  });
+}
+
 test("oversized unterminated MCP marker output stays bounded and hidden", async () => {
   const preload = loadPreloadWithFakeElectron();
   try {
@@ -594,16 +723,19 @@ test("oversized unterminated MCP marker output stays bounded and hidden", async 
     });
 
     await sleep(100);
-    assert.deepEqual(received, []);
+    assert.deepEqual(received, [{
+      chunk: "",
+      meta: { pluginPipelineIngressBytes: 12 + (70 * 1024) },
+    }]);
 
     preload.handlers.get("netcatty:data")?.({}, {
       sessionId: "session-1",
       data: "tail\nREADY\n",
     });
-    assert.deepEqual(received, [{
-      chunk: "READY\n",
-      meta: undefined,
-    }]);
+    assert.deepEqual(received, [
+      { chunk: "", meta: { pluginPipelineIngressBytes: 12 + (70 * 1024) } },
+      { chunk: "READY\n", meta: { pluginPipelineIngressBytes: "tail\nREADY\n".length } },
+    ]);
   } finally {
     preload.cleanup();
   }
@@ -729,10 +861,10 @@ test("MCP-filtered terminal perf metadata is not carried to later output", () =>
       data: "READY\n",
     });
 
-    assert.deepEqual(received, [{
-      chunk: "READY\n",
-      meta: undefined,
-    }]);
+    assert.deepEqual(received, [
+      { chunk: "", meta: { pluginPipelineIngressBytes: "__NCMCP_TEST\n".length } },
+      { chunk: "READY\n", meta: undefined },
+    ]);
   } finally {
     preload.cleanup();
   }
@@ -752,12 +884,16 @@ test("delayed MCP terminal data flush preserves metadata", async () => {
       meta: { droppedOutputMayAffectTerminalState: true },
     });
 
-    assert.deepEqual(received, []);
+    const creditOnly = {
+      chunk: "",
+      meta: { droppedOutputMayAffectTerminalState: true, pluginPipelineIngressBytes: "prompt __NCM".length },
+    };
+    assert.deepEqual(received, [creditOnly]);
     await sleep(100);
 
-    assert.deepEqual(received, [{
+    assert.deepEqual(received, [creditOnly, {
       chunk: "prompt __NCM",
-      meta: { droppedOutputMayAffectTerminalState: true },
+      meta: { droppedOutputMayAffectTerminalState: true, pluginPipelineIngressBytes: 0 },
     }]);
   } finally {
     preload.cleanup();
@@ -836,6 +972,9 @@ test("MCP-filtered empty terminal data carries metadata to next visible output",
     });
 
     assert.deepEqual(received, [{
+      chunk: "",
+      meta: { droppedOutputMayAffectTerminalState: true, pluginPipelineIngressBytes: "__NCMCP_TEST\n".length },
+    }, {
       chunk: "READY\n",
       meta: { droppedOutputMayAffectTerminalState: true },
     }]);
@@ -867,6 +1006,13 @@ test("MCP metadata merge clears stale alternate-screen action on later unknown r
     });
 
     assert.deepEqual(received, [{
+      chunk: "",
+      meta: {
+        droppedOutputMayAffectTerminalState: true,
+        droppedOutputAlternateScreenAction: "leave",
+        pluginPipelineIngressBytes: "__NCMCP_TEST\n".length,
+      },
+    }, {
       chunk: "READY\n",
       meta: { droppedOutputMayAffectTerminalState: true },
     }]);
@@ -899,6 +1045,9 @@ test("MCP-filtered empty terminal metadata is cleared on session exit", async ()
     });
 
     assert.deepEqual(received, [{
+      chunk: "",
+      meta: { droppedOutputMayAffectTerminalState: true, pluginPipelineIngressBytes: "__NCMCP_TEST\n".length },
+    }, {
       chunk: "READY\n",
       meta: undefined,
     }]);

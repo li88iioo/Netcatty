@@ -175,17 +175,28 @@ function filterMcpChunk(sessionId, chunk, meta) {
   const heldMeta = _mcpLineMetas.get(sessionId);
   const heldIngressAlreadyAcknowledged = heldMeta?.pluginPipelineIngressBytes === 0;
   const pendingMeta = _mcpPendingMetas.get(sessionId);
-  const stateMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), meta);
-  const sameChunkMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), meta, {
+  const data = held + chunk;
+  const needsMarkerFilter = _mcpDroppingWrappedLine.has(sessionId)
+    || _mcpProbePrompts.has(sessionId)
+    || data.includes("__NCMCP_")
+    || _endsWithMarkerPrefix(data);
+  // The backend charges the original output, including hidden command echoes
+  // and probes. Carry that ingress through filtering for ordinary sessions as
+  // well as plugin sessions, or their unacknowledged bytes accumulate and can
+  // prevent a temporary resize pause from ever reaching its resume watermark.
+  const ingressMeta = needsMarkerFilter && !hasPluginPipelineIngressMarker(meta)
+    ? { ...(meta || {}), pluginPipelineIngressBytes: chunk.length }
+    : meta;
+  const stateMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), ingressMeta);
+  const sameChunkMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), ingressMeta, {
     preserveTerminalPerf: true,
   });
-  const data = held + chunk;
   _mcpLineBufs.delete(sessionId);
   _mcpLineMetas.delete(sessionId);
   _mcpPendingMetas.delete(sessionId);
 
   // Fast path: nothing suspicious in the combined data
-  if (!_mcpDroppingWrappedLine.has(sessionId) && !_mcpProbePrompts.has(sessionId) && !data.includes("__NCMCP_") && !_endsWithMarkerPrefix(data)) {
+  if (!needsMarkerFilter) {
     const deliveryMeta = held ? stateMeta : sameChunkMeta;
     return {
       data,
@@ -253,6 +264,18 @@ function filterMcpChunk(sessionId, chunk, meta) {
   }
 
   const deliveryMeta = !held && result === chunk ? sameChunkMeta : stateMeta;
+  if (!result && deliveryMeta) {
+    // Flow credit is delivered immediately even when every display byte was
+    // filtered. Keep terminal-state metadata for the next visible output,
+    // without carrying its already-returned credit or per-chunk perf trace.
+    const pendingStateMeta = mergeTerminalDataMeta(undefined, deliveryMeta);
+    if (pendingStateMeta) {
+      delete pendingStateMeta.pluginPipelineIngressBytes;
+      if (Object.keys(pendingStateMeta).length > 0) {
+        _mcpPendingMetas.set(sessionId, pendingStateMeta);
+      }
+    }
+  }
   return {
     data: result,
     meta: heldIngressAlreadyAcknowledged
